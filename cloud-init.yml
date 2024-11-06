@@ -1,0 +1,91 @@
+#cloud-config
+
+# Define a new user with sudo privileges and SSH access
+users:
+  - name: shradmin
+    sudo: ALL=(ALL) NOPASSWD:ALL                 # Grant passwordless sudo privileges
+    ssh_authorized_keys:
+      - # Add authorized SSH key
+    shell: /bin/bash
+    groups: sudo                                 # Add to sudo group
+    lock_passwd: true                            # Lock password to enforce SSH access only
+    no_create_home: false                        # Ensure home directory creation
+
+# Update and upgrade system packages
+package_update: true
+package_upgrade: true
+
+# Install necessary packages
+packages:
+  - apt-transport-https
+  - software-properties-common
+  - prometheus
+  - prometheus-node-exporter
+  - git
+
+# Configuration files to be written on the instance
+write_files:
+  # Prometheus datasource configuration for Grafana
+  - content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://localhost:9090
+    path: /etc/grafana/provisioning/datasources/prometheus.yml
+    permissions: "0644"
+
+  # Node Exporter dashboard configuration for Grafana
+  - content: |
+      apiVersion: 1
+      providers:
+        - name: Full Node Exporter
+          disableDeletion: true
+          options:
+            path: /etc/grafana/provisioning/dashboards/default/node-full.json
+    path: /etc/grafana/provisioning/dashboards/node-exporter.yml
+    permissions: "0644"
+
+  # Grafana repository configuration for APT
+  - content: |
+      deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main
+    path: /etc/apt/sources.list.d/grafana.list
+    permissions: "0644"
+
+  # Prometheus backup script with Git integration on one of my repositorys
+  - content: |
+      #!/bin/bash
+      BACKUP_DIR="/var/backups/prometheus"
+      mkdir -p $BACKUP_DIR
+      TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+      BACKUP_FILE="$BACKUP_DIR/prometheus-backup-$TIMESTAMP.tar.gz"
+      
+      tar -czvf $BACKUP_FILE /var/lib/prometheus
+
+      REPO_DIR="/var/backups/prometheus_repo"
+      REPO_URL="https://github.com/aledog007/prometheus-backups.git"
+      mkdir -p $REPO_DIR
+
+      if [ ! -d "$REPO_DIR/.git" ]; then
+        git clone $REPO_URL $REPO_DIR
+      fi
+
+      cd $REPO_DIR
+      cp $BACKUP_FILE $REPO_DIR
+      git add .
+      git commit -m "Backup at $TIMESTAMP"
+      git push origin main
+    path: /usr/local/bin/prometheus-backup-git.sh
+    permissions: "0755"
+
+# Commands to run at the end of cloud-init
+runcmd:
+  - mkdir -p /etc/apt/keyrings/                                       # Create keyrings directory
+  - curl -o /etc/grafana/provisioning/dashboards/default/node-full.json https://grafana.com/api/dashboards/1860/revisions/37/download  # Download Grafana Node Exporter dashboard JSON
+  - wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null  # Add Grafana GPG key
+  - apt-get update                                                   # Update package lists
+  - apt-get install -y grafana                                       # Install Grafana
+  - /bin/systemctl daemon-reload                                     # Reload systemd manager configuration
+  - /bin/systemctl enable --now grafana-server                       # Enable and start Grafana service
+  - bash /usr/local/bin/prometheus-restore.sh                        # Execute Prometheus restore script
+  - (crontab -l ; echo "0 2 * * * /usr/local/bin/prometheus-backup-git.sh") | crontab -   # Schedule daily backups at 2 AM
